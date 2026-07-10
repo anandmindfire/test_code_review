@@ -1,23 +1,28 @@
-name: Local AI Code Review
+name: AI Code Review
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
+
+# The review needs to write comments back to the PR.
+permissions:
+  contents: read
+  pull-requests: write
+
+# Cancel superseded runs when new commits are pushed to the same PR.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   review:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0          # full history so we can diff against the base branch
 
-      # Cache the pulled model blobs so re-runs don't re-download ~4.4 GB every time.
       - name: Cache Ollama models
         uses: actions/cache@v4
         with:
@@ -33,16 +38,19 @@ jobs:
           echo "Waiting for Ollama to start..."
           for i in $(seq 1 30); do
             if curl -s http://localhost:11434 > /dev/null; then
-              echo "Ollama is up."
-              exit 0
+              echo "Ollama is up."; exit 0
             fi
             sleep 2
           done
-          echo "Ollama did not come up in time" >&2
-          exit 1
+          echo "Ollama did not come up in time" >&2; exit 1
 
       - name: Pull model (quantized 4-bit)
         run: ollama pull qwen2.5-coder:7b-instruct-q4_0
 
-      - name: Run AI code review
-        run: bash scripts/review.sh
+      - name: Run AI review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODEL: qwen2.5-coder:7b-instruct-q4_0
+          # Set to "true" ONLY if your repo/org allows Actions to approve PRs.
+          ALLOW_APPROVE: "false"
+        run: python3 scripts/review.py
