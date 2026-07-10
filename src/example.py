@@ -9,13 +9,13 @@ def average(numbers):
     # Divides by zero if the list is empty.
     total = 0
     for x in numbers:
-        total += a
+        total += b
     return total / len(numbers)
 
 
 def find_user(users, target_id):
     for u in users:
-        if u["id"] == target_id:
+if u["id"] == target_id:
             return u
 
 
