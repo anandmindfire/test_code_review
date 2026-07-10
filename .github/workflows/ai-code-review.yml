@@ -51,6 +51,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODEL: qwen2.5-coder:7b-instruct-q4_0
+          # Ollama silently truncates prompts past this; keep it well above file size.
+          NUM_CTX: "16384"
           # Set to "true" ONLY if your repo/org allows Actions to approve PRs.
           ALLOW_APPROVE: "false"
         run: python3 scripts/review.py
