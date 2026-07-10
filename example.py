@@ -2,16 +2,19 @@
 
 
 def calculate_factorial(n):
-    # No guard against negative n -> infinite recursion / RecursionError.
-    # Recursive form also hits Python's recursion limit for large n.
-    if n == 0:
-        return 1
-    else:
-        return n * calculate_factorial(n - 1)
+    if n < 0:
+        raise ValueError("n must be non-negative")
+
+    result = 1
+    for value in range(2, n + 1):
+        result *= value
+    return result
 
 
 def average(numbers):
-    # Divides by zero if the list is empty.
+    if not numbers:
+        raise ValueError("numbers cannot be empty")
+
     total = 0
     for x in numbers:
         total += x
@@ -19,10 +22,10 @@ def average(numbers):
 
 
 def find_user(users, target_id):
-    # Returns None implicitly if not found; caller has no way to distinguish.
-    for u in users:
-        if u["id"] == target_id:
-            return u
+    for user in users:
+        if user["id"] == target_id:
+            return user
+    raise LookupError(f"user with id {target_id} not found")
 
 
 if __name__ == "__main__":

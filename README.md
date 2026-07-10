@@ -10,6 +10,7 @@ runs on the runner itself.
 .github/workflows/ai-code-review.yml   # the CI job
 scripts/review.sh                      # finds changed .py files, asks the model
 src/example.py                         # sample file with intentional bugs
+src/__init__.py                        # package marker for tests/imports
 ```
 
 ## How to try it
