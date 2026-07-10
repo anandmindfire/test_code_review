@@ -1,51 +1,87 @@
-# Local AI Code Review (Ollama + Qwen2.5-Coder)
+# AI Code Review (CodeRabbit-style, local model)
 
-Runs a local open model inside a GitHub-hosted runner to review changed Python
-files on every push / PR to `main`. No API keys, no external calls — the model
-runs on the runner itself.
+A self-hosted PR reviewer that runs a local open model (Qwen2.5-Coder via
+Ollama) inside a GitHub-hosted runner. On every pull request it:
+
+- **Targets the diff** — parses the PR's unified diff and reviews only changed lines.
+- **Posts inline comments** anchored to specific lines, tagged 🛑 blocking / ⚠️ warning / 💡 nit.
+- **Posts a sticky summary** ("walkthrough") comment with a per-file table and a verdict. It is *updated in place* on each new push, not duplicated.
+- **Approves / requests changes** — REQUEST_CHANGES if anything blocking, COMMENT otherwise, APPROVE when clean (see limitation below).
+
+No API keys, no data leaves the runner.
 
 ## Layout
 
 ```
-.github/workflows/ai-code-review.yml   # the CI job
-scripts/review.sh                      # finds changed .py files, asks the model
-src/example.py                         # sample file with intentional bugs
-src/__init__.py                        # package marker for tests/imports
+.github/workflows/ai-code-review.yml   # PR-triggered job
+scripts/review.py                      # diff parsing, model calls, PR posting (stdlib only)
+scripts/review.sh                      # older push-time log-only version (optional)
+src/example.py                         # sample file with planted bugs
 ```
 
-## How to try it
+## Setup
 
-1. Create a new GitHub repo and copy these files in (keep the paths).
-2. Push to `main`, or open a PR against `main`.
-3. Open the run in the **Actions** tab and expand the "Run AI code review" step.
-   Each reviewed file is a collapsible group.
+1. Copy the files into your repo (keep paths).
+2. Enable write-back: **Settings → Actions → General → Workflow permissions →
+   "Read and write permissions."** (The workflow also declares
+   `permissions: pull-requests: write`.)
+3. Open a PR against `main` that changes a supported file
+   (`.py .js .ts .tsx .jsx .go .rb .java .rs .c .cpp .h` by default — edit `REVIEW_EXTS`).
+4. Watch the **Actions** tab; comments and the summary appear on the PR.
 
-## Why this differs from a naive `ollama run` setup
+## Two limitations that matter in production
 
-- **HTTP API instead of `ollama run`.** `ollama run` prints a spinner and ANSI
-  escape codes that pollute captured output. The script POSTs to
-  `/api/chat` with `stream:false` and pulls `.message.content` with `jq`.
-- **`jq` builds the request body**, so code containing quotes/newlines is
-  escaped correctly instead of breaking the JSON.
-- **Model caching.** `actions/cache` stores `~/.ollama/models` so re-runs skip
-  the ~4.4 GB download.
-- **Install URL.** The script is `https://ollama.com/install.sh` (piping the
-  bare domain `https://ollama.com` to `sh` won't work).
-- **Health check has a timeout** so a failed daemon fails the job instead of
-  hanging until the 20‑min limit.
+**1. Actions can't APPROVE by default.** The built-in `GITHUB_TOKEN` is blocked
+from submitting *approving* reviews (a security measure so a workflow can't
+approve its own code). REQUEST_CHANGES and COMMENT always work. To get real
+APPROVE:
+- Enable **Settings → Actions → General → "Allow GitHub Actions to create and
+  approve pull requests,"** then set `ALLOW_APPROVE: "true"` in the workflow; **or**
+- Post the review with a **PAT or GitHub App token** from a bot account instead
+  of `GITHUB_TOKEN`.
+The script attempts APPROVE and automatically falls back to COMMENT if it's
+blocked, so it never fails the run.
 
-## Notes on resources / speed
+**2. Fork PRs get a read-only token.** PRs from forked repos run with a
+read-only `GITHUB_TOKEN` and can't post comments. This setup works for
+same-repo (branch) PRs out of the box. Supporting fork PRs safely requires the
+`pull_request_target` trigger with careful handling — it's deliberately not used
+here because it runs with a write token and is easy to misconfigure into a
+security hole.
 
-- Standard GitHub-hosted `ubuntu-latest` runners have 4 vCPUs and ~16 GB RAM,
-  so the 4-bit 7B model (~4.4 GB) fits fine.
-- Inference is **CPU-only** here, so expect roughly tens of seconds to a couple
-  of minutes per file. Keep the set of reviewed files small, or switch to a
-  smaller tag (e.g. `qwen2.5-coder:3b`) if runs feel slow.
-- `q4_0` is a fine, small quant. `qwen2.5-coder:7b-instruct-q4_K_M` (~4.7 GB) is
-  usually a slightly better quality/size tradeoff if you want to compare.
+## How inline anchoring stays valid
 
-## Making it post PR comments (optional next step)
+GitHub rejects the entire review (HTTP 422) if any inline comment points at a
+line that isn't part of the diff. So `review.py`:
+- parses each hunk to build the set of valid new-file line numbers,
+- tells the model exactly which line numbers it may reference,
+- keeps only findings on valid lines, **snapping** near-misses (±`SNAP_WINDOW`,
+  default 2) to the closest changed line and dropping anything further,
+- falls back to a summary-only review if a bad anchor still slips through.
 
-Right now results only appear in the Actions log. To surface them on the PR,
-have `review.sh` write to a file and add a step using `actions/github-script`
-or the `gh` CLI to post it as a comment. Ask if you want that wired up.
+## Tuning (env in the workflow)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MODEL` | `qwen2.5-coder:7b-instruct-q4_0` | Ollama model tag |
+| `REVIEW_EXTS` | common code extensions | which files to review |
+| `MAX_FILES` | `20` | cap files per PR |
+| `MAX_ADDED_LINES` | `400` | cap lines per file (bounds CPU time) |
+| `SNAP_WINDOW` | `2` | line-number recovery window |
+| `ALLOW_APPROVE` | `false` | allow APPROVE verdict (needs repo setting) |
+
+## Performance
+
+Standard `ubuntu-latest` runners are 4 vCPU / ~16 GB RAM, so the 4-bit 7B model
+(~4.4 GB) fits comfortably. Inference is CPU-only: budget tens of seconds to a
+couple of minutes per file. `actions/cache` keeps the model between runs so only
+the first run pays the download. For faster/cheaper runs use a smaller tag
+(`qwen2.5-coder:3b`) or a self-hosted GPU runner; for higher quality at similar
+size try `qwen2.5-coder:7b-instruct-q4_K_M`.
+
+## Known gaps vs. CodeRabbit (natural next steps)
+
+- Re-reviews post a fresh review each run rather than incremental/threaded
+  follow-ups. (The *summary* is deduped; inline reviews are not.)
+- No "resolve on fix" tracking, no chat replies to comments, no config file for
+  path filters. Ask if you want any of these wired up.
