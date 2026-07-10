@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-CodeRabbit-style local AI reviewer.
-
-Runs on `pull_request`. For each changed file it:
-  1. parses the unified diff to find which new-file lines can carry a comment,
-  2. asks a local Ollama model (JSON mode) for a summary + line-anchored findings,
-  3. keeps only findings whose line is valid in the diff,
-  4. posts ONE PR review with inline comments + an overall verdict,
-  5. upserts a sticky summary comment (the "walkthrough").
-
-Verdict logic:
-  - any "blocking" finding      -> REQUEST_CHANGES
-  - findings but none blocking  -> COMMENT
-  - no findings                 -> APPROVE (if ALLOW_APPROVE=true and the repo
-                                   allows Actions to approve), else COMMENT
-
-Only the Python standard library is used, so there is nothing to pip install.
-"""
 
 import json
 import os
