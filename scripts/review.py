@@ -35,7 +35,7 @@ MAX_FILES       = int(os.environ.get("MAX_FILES", "20"))
 MAX_ADDED_LINES = int(os.environ.get("MAX_ADDED_LINES", "400"))   # per file, keeps CPU inference bounded
 ALLOW_APPROVE   = os.environ.get("ALLOW_APPROVE", "false").lower() == "true"
 SNAP_WINDOW     = int(os.environ.get("SNAP_WINDOW", "2"))          # recover near-miss line numbers
-NUM_CTX         = int(os.environ.get("NUM_CTX", "16384"))          # MUST exceed prompt size or Ollama silently truncates
+NUM_CTX         = int(os.environ.get("NUM_CTX", "8192"))          # CPU-safe; Ollama truncates below prompt size, OOMs if too high
 
 MARKER = "<!-- ai-code-review:summary -->"
 
@@ -67,20 +67,24 @@ def gh_request(method, path, body=None, accept="application/vnd.github+json"):
         return e.code, e.read().decode()
 
 
-def ollama_chat(prompt):
+def ollama_chat(prompt, num_ctx):
     body = {
         "model": MODEL,
         "stream": False,
         "format": "json",                 # force valid JSON out of the model
         "messages": [{"role": "user", "content": prompt}],
-        "options": {"temperature": 0.2, "num_ctx": NUM_CTX},
+        "options": {"temperature": 0.2, "num_ctx": num_ctx},
     }
     req = urllib.request.Request(
         OLLAMA_URL, data=json.dumps(body).encode(), method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=900) as resp:
-        payload = json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:400]
+        raise RuntimeError(f"Ollama HTTP {e.code}: {detail}")
     content = payload.get("message", {}).get("content", "")
     meta = (payload.get("prompt_eval_count", 0), payload.get("eval_count", 0))
     return content, meta
@@ -162,12 +166,20 @@ def review_file(path, added):
     if len(added) > MAX_ADDED_LINES:
         keep = dict(sorted(added.items())[:MAX_ADDED_LINES])
         added = keep
-    try:
-        content, (ptok, etok) = ollama_chat(build_prompt(path, added))
-        data = json.loads(content)
-    except (json.JSONDecodeError, urllib.error.URLError, KeyError) as e:
-        print(f"  ! model/parse error for {path}: {e}", file=sys.stderr)
-        return {"summary": f"_(review skipped: {type(e).__name__})_", "findings": []}
+    # Try the configured context; if the server 500s (usually KV-cache OOM on a
+    # CPU runner), retry once at a smaller context that reliably fits.
+    ctx_attempts = [NUM_CTX] if NUM_CTX <= 4096 else [NUM_CTX, 4096]
+    data, ptok, etok, last_err = None, 0, 0, None
+    for ctx in ctx_attempts:
+        try:
+            content, (ptok, etok) = ollama_chat(build_prompt(path, added), ctx)
+            data = json.loads(content)
+            break
+        except (json.JSONDecodeError, urllib.error.URLError, RuntimeError, KeyError) as e:
+            last_err = e
+            print(f"  ! model error (num_ctx={ctx}) for {path}: {e}", file=sys.stderr)
+    if data is None:
+        return {"summary": f"_(review skipped: {last_err})_", "findings": []}
 
     raw = data.get("findings", []) or []
     print(f"  tokens: prompt={ptok}, response={etok}; raw findings={len(raw)}")
