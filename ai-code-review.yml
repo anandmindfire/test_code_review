@@ -1,0 +1,48 @@
+name: Local AI Code Review
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so we can diff against the base branch
+
+      # Cache the pulled model blobs so re-runs don't re-download ~4.4 GB every time.
+      - name: Cache Ollama models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen2.5-coder-7b-instruct-q4_0
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama daemon
+        run: |
+          ollama serve &
+          echo "Waiting for Ollama to start..."
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:11434 > /dev/null; then
+              echo "Ollama is up."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Ollama did not come up in time" >&2
+          exit 1
+
+      - name: Pull model (quantized 4-bit)
+        run: ollama pull qwen2.5-coder:7b-instruct-q4_0
+
+      - name: Run AI code review
+        run: bash scripts/review.sh
