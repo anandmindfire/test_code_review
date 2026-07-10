@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""
+CodeRabbit-style local AI reviewer.
+
+Runs on `pull_request`. For each changed file it:
+  1. parses the unified diff to find which new-file lines can carry a comment,
+  2. asks a local Ollama model (JSON mode) for a summary + line-anchored findings,
+  3. keeps only findings whose line is valid in the diff,
+  4. posts ONE PR review with inline comments + an overall verdict,
+  5. upserts a sticky summary comment (the "walkthrough").
+
+Verdict logic:
+  - any "blocking" finding      -> REQUEST_CHANGES
+  - findings but none blocking  -> COMMENT
+  - no findings                 -> APPROVE (if ALLOW_APPROVE=true and the repo
+                                   allows Actions to approve), else COMMENT
+
+Only the Python standard library is used, so there is nothing to pip install.
+"""
 
 import json
 import os
@@ -17,6 +35,7 @@ MAX_FILES       = int(os.environ.get("MAX_FILES", "20"))
 MAX_ADDED_LINES = int(os.environ.get("MAX_ADDED_LINES", "400"))   # per file, keeps CPU inference bounded
 ALLOW_APPROVE   = os.environ.get("ALLOW_APPROVE", "false").lower() == "true"
 SNAP_WINDOW     = int(os.environ.get("SNAP_WINDOW", "2"))          # recover near-miss line numbers
+NUM_CTX         = int(os.environ.get("NUM_CTX", "16384"))          # MUST exceed prompt size or Ollama silently truncates
 
 MARKER = "<!-- ai-code-review:summary -->"
 
@@ -54,15 +73,17 @@ def ollama_chat(prompt):
         "stream": False,
         "format": "json",                 # force valid JSON out of the model
         "messages": [{"role": "user", "content": prompt}],
-        "options": {"temperature": 0.2},
+        "options": {"temperature": 0.2, "num_ctx": NUM_CTX},
     }
     req = urllib.request.Request(
         OLLAMA_URL, data=json.dumps(body).encode(), method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=900) as resp:
         payload = json.loads(resp.read().decode())
-    return payload.get("message", {}).get("content", "")
+    content = payload.get("message", {}).get("content", "")
+    meta = (payload.get("prompt_eval_count", 0), payload.get("eval_count", 0))
+    return content, meta
 
 
 # --------------------------------------------------------------------------- #
@@ -142,16 +163,21 @@ def review_file(path, added):
         keep = dict(sorted(added.items())[:MAX_ADDED_LINES])
         added = keep
     try:
-        content = ollama_chat(build_prompt(path, added))
+        content, (ptok, etok) = ollama_chat(build_prompt(path, added))
         data = json.loads(content)
     except (json.JSONDecodeError, urllib.error.URLError, KeyError) as e:
         print(f"  ! model/parse error for {path}: {e}", file=sys.stderr)
         return {"summary": f"_(review skipped: {type(e).__name__})_", "findings": []}
 
+    raw = data.get("findings", []) or []
+    print(f"  tokens: prompt={ptok}, response={etok}; raw findings={len(raw)}")
+    if ptok >= NUM_CTX:
+        print(f"  ! prompt hit num_ctx={NUM_CTX} — likely truncated; raise NUM_CTX", file=sys.stderr)
+
     valid_lines = sorted(added.keys())
     valid_set = set(valid_lines)
     clean = []
-    for f in data.get("findings", []):
+    for f in raw:
         try:
             ln = int(f["line"])
         except (KeyError, ValueError, TypeError):
@@ -168,6 +194,7 @@ def review_file(path, added):
         sev = f.get("severity", "warning").lower()
         sev = sev if sev in ("blocking", "warning", "nit") else "warning"
         clean.append({"line": ln, "severity": sev, "comment": f["comment"].strip()})
+    print(f"  kept {len(clean)} finding(s) after line validation")
     return {"summary": data.get("summary", "").strip(), "findings": clean}
 
 
